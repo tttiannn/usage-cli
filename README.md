@@ -4,24 +4,89 @@ A small English-language terminal wrapper around [ccusage](https://github.com/cc
 
 ## Requirements
 
-- macOS or Linux (uses POSIX process groups and file locks; Windows is not supported).
-- Python 3.9 or newer at `/usr/bin/python3`.
-- `ccusage` on your PATH; developed with version 20.0.45.
-- `curl` for optional pricing downloads.
+- Windows 10/11, macOS, or Linux.
+- Python 3.9 or newer (3.11+ recommended).
+- Node.js LTS and npm, used to install and run ccusage.
+- Git to clone this repository, or download and extract the repository ZIP.
+- `curl` on PATH for optional pricing downloads. Modern Windows and macOS include it; on Debian/Ubuntu use `sudo apt install curl`.
 
-Install ccusage using its [installation instructions](https://ccusage.com/guide/installation), then install this wrapper:
+The wrapper uses Python's standard library only. It was developed against ccusage 20.0.45; newer ccusage releases may change report schemas.
 
-```sh
-sh install.sh
+## Install on Windows
+
+1. Install [Python](https://www.python.org/downloads/windows/), [Node.js LTS](https://nodejs.org/en/download), and [Git](https://git-scm.com/downloads/win). Enable the Python launcher / PATH option when offered. Open a new PowerShell window.
+2. Verify prerequisites and install ccusage. Use `npm.cmd` in PowerShell to avoid script execution-policy errors:
+
+```powershell
+py -3 --version
+node --version
+npm.cmd install -g ccusage
+ccusage.cmd --version
+git clone https://github.com/tttiannn/usage-cli.git
+cd usage-cli
+py -3 install.py
 ```
 
-The installer copies `bin/usage` to `~/.local/bin/usage`. It refuses to overwrite a different file unless you pass `--force`. If necessary, add this line to your shell configuration and open a new terminal:
+If `py` is unavailable but `python --version` shows Python 3.9+, replace `py -3` with `python`. If `ccusage.cmd` is not found after installation, reopen the terminal and check that npm's global directory is on PATH (`npm.cmd prefix -g`).
+
+3. Add the wrapper's directory to the **user** PATH once (no administrator rights required):
+
+```powershell
+$usageBin = Join-Path $env:LOCALAPPDATA 'Programs\usage-cli\bin'
+$userPath = [string][Environment]::GetEnvironmentVariable('Path', 'User')
+if (($userPath -split ';') -notcontains $usageBin) {
+    [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';') + ';' + $usageBin).TrimStart(';')), 'User')
+}
+$env:Path = $env:Path.TrimEnd(';') + ';' + $usageBin
+usage --help
+usage week -v
+```
+
+Alternatively, add `%LOCALAPPDATA%\Programs\usage-cli\bin` through Windows' Environment Variables dialog. The installer creates `usage.cmd` and `usage.py` there. The launcher uses the Python interpreter selected at installation time.
+
+## Install on macOS
+
+Install Python 3, Node.js LTS/npm, and Git using your preferred installer. With [Homebrew](https://brew.sh/), the dependencies are available as `python`, `node`, and `git`.
+
+```sh
+python3 --version
+node --version
+npm install -g ccusage
+git clone https://github.com/tttiannn/usage-cli.git
+cd usage-cli
+python3 install.py
+```
+
+If necessary, add the following to `~/.zshrc`, then open a new terminal:
 
 ```sh
 export PATH="$PATH:$HOME/.local/bin"
 ```
 
-Check for a name conflict with `type -a usage`. Appending the directory to PATH preserves the priority of existing commands; aliases and functions can also take priority over this executable.
+Then run `usage --help`. `sh install.sh` is a convenience entry for the same installer.
+
+## Install on Linux
+
+Install Python 3.9+, Git, curl, and Node.js LTS/npm using your distribution or the official installers. On Debian/Ubuntu, `sudo apt install python3 git curl` provides the first three; verify your Python version and use the [Node.js installer instructions](https://nodejs.org/en/download) for Node LTS. Prefer a user-managed Node installation if global npm installs otherwise require administrator permissions.
+
+```sh
+python3 --version
+node --version
+npm install -g ccusage
+git clone https://github.com/tttiannn/usage-cli.git
+cd usage-cli
+python3 install.py
+```
+
+If needed, add `export PATH="$PATH:$HOME/.local/bin"` to your shell startup file (`~/.bashrc` for Bash, `~/.zshrc` for Zsh). Open a new terminal and run `usage --help`.
+
+## Installation behavior and updates
+
+The installer does not modify PATH or shell profiles, and refuses to overwrite different existing files. Inspect an existing installation before using `python3 install.py --force` (Windows: `py -3 install.py --force`). To update, run `git pull --ff-only` in the cloned repository, then rerun the installer with `--force`. Rerun installation after moving/removing its Python interpreter.
+
+Use `python3 install.py --dir /your/chosen/bin` or `py -3 install.py --dir 'C:\your\chosen\bin'` for a custom destination. Both `usage` (Unix) / `usage.cmd` (Windows) and the accompanying `usage.py` must stay together.
+
+Check for name conflicts with `type -a usage` on macOS/Linux or `Get-Command usage -All` in PowerShell. Appending to PATH preserves existing command priority; aliases and functions can also take priority.
 
 ## Examples
 
@@ -64,7 +129,7 @@ Cache files are stored under `~/.cache/usage/`. A file lock prevents simultaneou
 
 This wrapper downloads public price data and reads local reports through ccusage. It does not send usage logs or credentials to the pricing sources. Pricing servers receive ordinary download request metadata, such as your IP address. `curl` uses its normal proxy configuration.
 
-Report output is limited to 32 MiB, pricing downloads to 20 MiB, and each ccusage report call to 180 seconds. Each child command runs in its own process group, which is cleaned up on completion, timeout, or handled interruption. Force-killing the wrapper with `SIGKILL` bypasses Python cleanup.
+Report output is limited to 32 MiB, pricing downloads to 20 MiB, and each ccusage report call to 180 seconds. On macOS/Linux, each child runs in a private process group. On Windows, a gated launcher is assigned to a kill-on-close Job Object before it starts the command. Commands and descendants are cleaned up on completion, timeout, or handled interruption. The wrapper uses bounded pipe-reading threads, which stop after each command. OS-level force-kills can bypass Python cleanup (especially POSIX `SIGKILL`). A restrictive Windows job policy can prevent startup; it fails rather than running without process containment.
 
 ## Development
 
@@ -77,10 +142,25 @@ Tests use synthetic data and do not require ccusage, a network connection, or pe
 
 ## Uninstall
 
+macOS/Linux:
+
 ```sh
-rm "$HOME/.local/bin/usage"
+rm "$HOME/.local/bin/usage" "$HOME/.local/bin/usage.py"
 # Optional: remove downloaded prices
 rm -rf "$HOME/.cache/usage"
 ```
 
-This leaves ccusage itself installed.
+Windows (PowerShell):
+
+```powershell
+Remove-Item "$env:LOCALAPPDATA\Programs\usage-cli\bin\usage.cmd"
+Remove-Item "$env:LOCALAPPDATA\Programs\usage-cli\bin\usage.py"
+# Optional: remove downloaded prices
+Remove-Item "$HOME\.cache\usage" -Recurse
+```
+
+Remove the wrapper directory from your user PATH if desired. These steps leave ccusage itself installed.
+
+## Validation
+
+The CI matrix covers Windows, macOS and Linux with Python 3.9 and 3.13. Tests cover price-cache expiration, failure cooldown, file locking, config cleanup, bounded output, process-tree cleanup, and installation in paths containing spaces. The CI configuration is not proof of a passing run: check the repository Actions page for results. Account-level GitHub billing restrictions can prevent hosted jobs from starting.

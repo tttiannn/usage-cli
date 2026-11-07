@@ -1,7 +1,6 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """Readable local ccusage reports. No third-party Python packages required."""
 import argparse
-import fcntl
 import math
 import tempfile
 from pathlib import Path
@@ -9,7 +8,8 @@ from contextlib import contextmanager
 import datetime as dt
 import json
 import os
-import selectors
+import queue
+import threading
 import signal
 import shutil
 import subprocess
@@ -18,30 +18,149 @@ import time
 from collections import defaultdict
 
 
-def run_report(command, timeout=180, output_limit=32 * 1024 * 1024):
-    """Bound output and lifetime; reap the child and kill its private process group."""
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          start_new_session=True) as process:
+@contextmanager
+def refresh_lock(stream):
+    """Nonblocking process lock; released by the OS even after a crash."""
+    acquired = False
+    if os.name == 'nt':
+        import msvcrt
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b'0')
+            stream.flush()
+        stream.seek(0)
         try:
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            acquired = True
+        except OSError:
+            pass
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+        except BlockingIOError:
+            pass
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                fcntl.flock(stream, fcntl.LOCK_UN)
+
+
+class WindowsJob:
+    """Kill-on-close job containing a gated launcher and all its descendants."""
+    def __init__(self, process):
+        import ctypes
+        from ctypes import wintypes as w
+        class Basic(ctypes.Structure):
+            _fields_ = [('process_time', ctypes.c_longlong), ('job_time', ctypes.c_longlong),
+                        ('flags', w.DWORD), ('min_ws', ctypes.c_size_t), ('max_ws', ctypes.c_size_t),
+                        ('active', w.DWORD), ('affinity', ctypes.c_size_t), ('priority', w.DWORD), ('scheduling', w.DWORD)]
+        class IO(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_ulonglong) for name in ('read_ops', 'write_ops', 'other_ops', 'read_bytes', 'write_bytes', 'other_bytes')]
+        class Extended(ctypes.Structure):
+            _fields_ = [('basic', Basic), ('io', IO), ('process_memory', ctypes.c_size_t),
+                        ('job_memory', ctypes.c_size_t), ('peak_process', ctypes.c_size_t), ('peak_job', ctypes.c_size_t)]
+        self.api = ctypes.WinDLL('kernel32', use_last_error=True)
+        for name, args, result in [
+            ('CreateJobObjectW', [ctypes.c_void_p, w.LPCWSTR], w.HANDLE),
+            ('SetInformationJobObject', [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD], w.BOOL),
+            ('OpenProcess', [w.DWORD, w.BOOL, w.DWORD], w.HANDLE),
+            ('AssignProcessToJobObject', [w.HANDLE, w.HANDLE], w.BOOL),
+            ('CloseHandle', [w.HANDLE], w.BOOL),
+        ]:
+            fn = getattr(self.api, name)
+            fn.argtypes, fn.restype = args, result
+        self.handle = self.api.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            info = Extended()
+            info.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            if not self.api.SetInformationJobObject(self.handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            handle = self.api.OpenProcess(0x0100 | 0x0001, False, process.pid)
+            if not handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                if not self.api.AssignProcessToJobObject(self.handle, handle):
+                    raise ctypes.WinError(ctypes.get_last_error())
+            finally:
+                self.api.CloseHandle(handle)
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        if self.handle:
+            self.api.CloseHandle(self.handle)
+            self.handle = None
+
+
+def run_report(command, timeout=180, output_limit=32 * 1024 * 1024):
+    """Bound capture on every OS; clean up all owned descendants on exit."""
+    windows = os.name == 'nt'
+    actual = command
+    if windows:
+        # Gate the launcher until assignment to a job, closing the child-spawn race.
+        bootstrap = 'import subprocess,sys; sys.stdin.buffer.read(1); sys.exit(subprocess.call(sys.argv[1:], stdin=subprocess.DEVNULL))'
+        actual = [sys.executable, '-c', bootstrap] + command
+    with subprocess.Popen(actual, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          stdin=subprocess.PIPE if windows else subprocess.DEVNULL,
+                          start_new_session=not windows) as process:
+        job = None
+        stop = threading.Event()
+        messages = queue.Queue(maxsize=8)
+        readers = []
+        def read_pipe(stream, name):
+            try:
+                while not stop.is_set():
+                    chunk = os.read(stream.fileno(), 65536)
+                    while not stop.is_set():
+                        try:
+                            messages.put((name, chunk), timeout=.1)
+                            break
+                        except queue.Full:
+                            pass
+                    if not chunk:
+                        break
+            except OSError:
+                pass
+        try:
+            if windows:
+                job = WindowsJob(process)
+                process.stdin.write(b'1')
+                process.stdin.flush()
+                process.stdin.close()
+            for name, stream in [('stdout', process.stdout), ('stderr', process.stderr)]:
+                reader = threading.Thread(target=read_pipe, args=(stream, name), daemon=True)
+                reader.start()
+                readers.append(reader)
             chunks = {'stdout': bytearray(), 'stderr': bytearray()}
-            size = 0
+            size, eof = 0, set()
             deadline = time.monotonic() + timeout
-            with selectors.DefaultSelector() as selector:
-                selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
-                selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
-                while selector.get_map():
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise subprocess.TimeoutExpired(command, timeout)
-                    for key, _ in selector.select(min(remaining, 0.25)):
-                        chunk = os.read(key.fileobj.fileno(), 65536)
-                        if not chunk:
-                            selector.unregister(key.fileobj)
-                            continue
-                        size += len(chunk)
-                        if size > output_limit:
-                            raise RuntimeError('ccusage output exceeded the 32 MiB safety limit; use a shorter date range.')
-                        chunks[key.data].extend(chunk)
+            while len(eof) < 2:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                try:
+                    name, chunk = messages.get(timeout=min(remaining, .1))
+                except queue.Empty:
+                    continue
+                if not chunk:
+                    eof.add(name)
+                    continue
+                size += len(chunk)
+                if size > output_limit:
+                    raise RuntimeError(f'Command output exceeded the {output_limit:,}-byte safety limit; use a shorter date range.')
+                chunks[name].extend(chunk)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(command, timeout)
@@ -50,13 +169,33 @@ def run_report(command, timeout=180, output_limit=32 * 1024 * 1024):
                 chunks['stdout'].decode('utf-8', errors='replace'),
                 chunks['stderr'].decode('utf-8', errors='replace'))
         finally:
-            # This CLI only reads reports. No write transaction needs a grace period.
-            # Kill the group even if the launcher already exited, then reap it.
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            stop.set()
+            if job is not None:
+                job.close()
+            elif windows:
+                process.kill()  # Job assignment failed; the gate never opened.
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             process.wait()
+            for reader in readers:
+                reader.join(timeout=1)
+
+
+def ccusage_command():
+    executable = shutil.which('ccusage')
+    if not executable:
+        raise RuntimeError('ccusage not found on PATH. Install it with: npm install -g ccusage')
+    if os.name == 'nt' and Path(executable).suffix.lower() in ('.cmd', '.bat', '.ps1'):
+        # Run npm's JS entry through node directly, avoiding cmd.exe argument parsing.
+        entry = Path(executable).parent / 'node_modules' / 'ccusage' / 'src' / 'cli.js'
+        node = shutil.which('node')
+        if not entry.is_file() or not node:
+            raise RuntimeError('Cannot find the ccusage npm entry. Reinstall with: npm install -g ccusage')
+        return [node, str(entry)]
+    return [executable]
 
 
 def exit_on_signal(signum, frame):
@@ -67,7 +206,8 @@ def exit_on_signal(signum, frame):
 def add_codex_model_costs(data, command):
     """Use ccusage's own priced breakdown; only merge matching daily snapshots."""
     # Unified reports include per-model costs; focused Codex reports include reasoning.
-    pricing_command = [command[0]] + command[2:] + ['--by-agent']
+    source_index = command.index('codex')
+    pricing_command = command[:source_index] + command[source_index + 1:] + ['--by-agent']
     result = run_report(pricing_command)
     if result.returncode:
         raise RuntimeError('Could not load ccusage model pricing: ' + result.stderr.strip())
@@ -154,7 +294,7 @@ def cached_pricing(force=False, offline=False, cache_dir=None):
     state_path = directory / 'pricing.json'
     def load():
         try:
-            value = json.loads(state_path.read_text())
+            value = json.loads(state_path.read_text(encoding='utf-8'))
             return value if isinstance(value, dict) and isinstance(value.get('sources', {}), dict) else {}
         except (OSError, ValueError):
             return {}
@@ -162,12 +302,8 @@ def cached_pricing(force=False, offline=False, cache_dir=None):
     sources = state.setdefault('sources', {})
     if not offline:
         # All invocations use the same lock inode; stale files do not hold locks.
-        with (directory / 'refresh.lock').open('a') as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                pass  # Another invocation refreshes; use the last atomic snapshot.
-            else:
+        with (directory / 'refresh.lock').open('a+b') as lock, refresh_lock(lock) as acquired:
+            if acquired:
                 state = load()
                 sources = state.setdefault('sources', {})
                 changed = False
@@ -219,7 +355,7 @@ def cached_pricing(force=False, offline=False, cache_dir=None):
                 if changed:
                     fd, temporary = tempfile.mkstemp(prefix='.pricing-', dir=str(directory))
                     try:
-                        with os.fdopen(fd, 'w') as stream:
+                        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
                             json.dump(state, stream, allow_nan=False)
                         os.replace(temporary, state_path)
                     finally:
@@ -251,7 +387,7 @@ def pricing_config(prices):
     config = {}
     for path in paths:
         try:
-            candidate = json.loads(path.read_text())
+            candidate = json.loads(path.read_text(encoding='utf-8'))
             if isinstance(candidate, dict):
                 config = candidate
                 break
@@ -265,7 +401,7 @@ def pricing_config(prices):
     defaults['pricingOverrides'] = merged
     with tempfile.TemporaryDirectory(prefix='usage-') as directory:
         path = Path(directory) / 'ccusage.json'
-        path.write_text(json.dumps(config))
+        path.write_text(json.dumps(config), encoding='utf-8')
         yield str(path)
 
 
@@ -298,10 +434,11 @@ def main():
         parser.error('Date range is too large')
     if start and start > end:
         parser.error('--since must not be after --until')
-    exe = shutil.which('ccusage')
-    if not exe:
-        parser.exit(1, 'Error: ccusage was not found on PATH.\n')
-    command = [exe] + ([] if args.source == 'all' else [args.source]) + ['daily', '--json', '--until', end.strftime('%Y%m%d')]
+    try:
+        prefix = ccusage_command()
+    except RuntimeError as error:
+        parser.exit(1, f'Error: {error}\n')
+    command = prefix + ([] if args.source == 'all' else [args.source]) + ['daily', '--json', '--until', end.strftime('%Y%m%d')]
     if start:
         command += ['--since', start.strftime('%Y%m%d')]
     pricing_status = 'built-in'
@@ -422,8 +559,12 @@ def main():
 
 
 if __name__ == '__main__':
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace')
     signal.signal(signal.SIGTERM, exit_on_signal)
-    signal.signal(signal.SIGHUP, exit_on_signal)
+    if hasattr(signal, 'SIGHUP'):
+        signal.signal(signal.SIGHUP, exit_on_signal)
     try:
         main()
     except KeyboardInterrupt:

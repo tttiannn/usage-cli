@@ -1,4 +1,4 @@
-import copy, fcntl, json, os, runpy, subprocess, tempfile, unittest
+import copy, json, os, runpy, subprocess, tempfile, unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -52,8 +52,8 @@ class CacheTests(unittest.TestCase):
         state = json.loads((self.directory / 'pricing.json').read_text())
         self.assertTrue(all('updated_at' not in v for v in state['sources'].values()))
     def test_concurrent_refresh_does_not_wait(self):
-        with (self.directory / 'refresh.lock').open('a') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with (self.directory / 'refresh.lock').open('a+b') as lock, api['refresh_lock'](lock) as acquired:
+            self.assertTrue(acquired)
             self.get()
         self.assertEqual(self.calls, [])
     def test_temporary_config_cleanup_and_user_priority(self):
