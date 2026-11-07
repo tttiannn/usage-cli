@@ -1,0 +1,430 @@
+#!/usr/bin/python3
+"""Readable local ccusage reports. No third-party Python packages required."""
+import argparse
+import fcntl
+import math
+import tempfile
+from pathlib import Path
+from contextlib import contextmanager
+import datetime as dt
+import json
+import os
+import selectors
+import signal
+import shutil
+import subprocess
+import sys
+import time
+from collections import defaultdict
+
+
+def run_report(command, timeout=180, output_limit=32 * 1024 * 1024):
+    """Bound output and lifetime; reap the child and kill its private process group."""
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          start_new_session=True) as process:
+        try:
+            chunks = {'stdout': bytearray(), 'stderr': bytearray()}
+            size = 0
+            deadline = time.monotonic() + timeout
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ, 'stdout')
+                selector.register(process.stderr, selectors.EVENT_READ, 'stderr')
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    for key, _ in selector.select(min(remaining, 0.25)):
+                        chunk = os.read(key.fileobj.fileno(), 65536)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            continue
+                        size += len(chunk)
+                        if size > output_limit:
+                            raise RuntimeError('ccusage output exceeded the 32 MiB safety limit; use a shorter date range.')
+                        chunks[key.data].extend(chunk)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            code = process.wait(timeout=remaining)
+            return subprocess.CompletedProcess(command, code,
+                chunks['stdout'].decode('utf-8', errors='replace'),
+                chunks['stderr'].decode('utf-8', errors='replace'))
+        finally:
+            # This CLI only reads reports. No write transaction needs a grace period.
+            # Kill the group even if the launcher already exited, then reap it.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+
+
+def exit_on_signal(signum, frame):
+    # Raising unwinds run_report's finally block before the wrapper exits.
+    raise SystemExit(128 + signum)
+
+
+def add_codex_model_costs(data, command):
+    """Use ccusage's own priced breakdown; only merge matching daily snapshots."""
+    # Unified reports include per-model costs; focused Codex reports include reasoning.
+    pricing_command = [command[0]] + command[2:] + ['--by-agent']
+    result = run_report(pricing_command)
+    if result.returncode:
+        raise RuntimeError('Could not load ccusage model pricing: ' + result.stderr.strip())
+    priced = json.loads(result.stdout)
+    priced_days = {}
+    for day in priced.get('daily', []):
+        for agent in day.get('agents', []):
+            if agent.get('agent') == 'codex':
+                priced_days[day['period']] = agent
+    keys = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheCreationTokens']
+    complete = True
+    for day in data.get('daily', []):
+        match = priced_days.get(day.get('date'))
+        if match is None or abs(match.get('totalCost', -1) - day.get('costUSD', -2)) > 1e-8:
+            complete = False
+            continue
+        breakdown = {item['modelName']: item for item in match.get('modelBreakdowns', [])}
+        for name, item in day.get('models', {}).items():
+            price = breakdown.get(name)
+            if (price is None or any(price.get(k, 0) != item.get(k, 0) for k in keys)
+                    or price.get('missingPricing') or item.get('missingPricing')
+                    or 'cost' not in price):
+                complete = False
+                continue
+            item['cost'] = price['cost']
+    return complete
+
+
+# Price catalogs are downloaded only at invocation time, never by a daemon.
+PRICE_INTERVAL = 7 * 86400
+RETRY_INTERVAL = 6 * 3600
+PRICE_URLS = {
+    'litellm': 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json',
+    'models.dev': 'https://models.dev/api.json',
+}
+
+
+def valid_rate(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+
+def catalog_prices(source, data):
+    prices = {}
+    if not isinstance(data, dict):
+        raise ValueError('Invalid catalog')
+    if source == 'litellm':
+        fields = {
+            'input_cost_per_token': 'inputCostPerToken',
+            'output_cost_per_token': 'outputCostPerToken',
+            'cache_read_input_token_cost': 'cacheReadInputTokenCost',
+            'cache_creation_input_token_cost': 'cacheCreationInputTokenCost',
+            'input_cost_per_token_above_200k_tokens': 'inputCostPerTokenAbove200kTokens',
+            'output_cost_per_token_above_200k_tokens': 'outputCostPerTokenAbove200kTokens',
+            'cache_read_input_token_cost_above_200k_tokens': 'cacheReadInputTokenCostAbove200kTokens',
+            'cache_creation_input_token_cost_above_200k_tokens': 'cacheCreationInputTokenCostAbove200kTokens',
+        }
+        for name, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            item = {dest: entry[key] for key, dest in fields.items() if valid_rate(entry.get(key))}
+            if 'inputCostPerToken' in item and 'outputCostPerToken' in item:
+                prices[name] = item
+    else:
+        for provider, entry in data.items():
+            if not isinstance(entry, dict):
+                continue
+            for name, model in entry.get('models', {}).items():
+                cost = model.get('cost', {})
+                item = {dest: cost[key] / 1_000_000 for key, dest in {
+                    'input': 'inputCostPerToken', 'output': 'outputCostPerToken',
+                    'cache_read': 'cacheReadInputTokenCost', 'cache_write': 'cacheCreationInputTokenCost',
+                }.items() if valid_rate(cost.get(key))}
+                if 'inputCostPerToken' in item and 'outputCostPerToken' in item:
+                    prices[provider + '/' + name] = item
+                    if provider in ('openai', 'anthropic', 'google', 'deepseek', 'moonshotai'):
+                        prices.setdefault(name, item)
+    # Keep ccusage's timestamp-dependent DeepSeek v4 schedules intact.
+    return {name: item for name, item in prices.items() if 'deepseek-v4' not in name.lower()}
+
+
+def cached_pricing(force=False, offline=False, cache_dir=None):
+    directory = cache_dir or Path.home() / '.cache' / 'usage'
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    state_path = directory / 'pricing.json'
+    def load():
+        try:
+            value = json.loads(state_path.read_text())
+            return value if isinstance(value, dict) and isinstance(value.get('sources', {}), dict) else {}
+        except (OSError, ValueError):
+            return {}
+    state = load()
+    sources = state.setdefault('sources', {})
+    if not offline:
+        # All invocations use the same lock inode; stale files do not hold locks.
+        with (directory / 'refresh.lock').open('a') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass  # Another invocation refreshes; use the last atomic snapshot.
+            else:
+                state = load()
+                sources = state.setdefault('sources', {})
+                changed = False
+                for name, url in PRICE_URLS.items():
+                    entry = sources.setdefault(name, {})
+                    now = time.time()
+                    updated = entry.get('updated_at', 0)
+                    attempted = entry.get('attempted_at', 0)
+                    fresh = 0 <= now - updated < PRICE_INTERVAL
+                    cooldown = 0 <= now - attempted < RETRY_INTERVAL
+                    if not force and (fresh or cooldown):
+                        continue
+                    entry['attempted_at'] = now
+                    changed = True
+                    try:
+                        curl = shutil.which('curl')
+                        if not curl:
+                            raise RuntimeError('curl not found')
+                        limit = 15 if force else 3
+                        urls = ([
+                            'https://cdn.jsdelivr.net/gh/BerriAI/litellm@main/model_prices_and_context_window.json',
+                            url,
+                        ] if name == 'litellm' else [url])
+                        last_error = None
+                        for download_url in urls:
+                            try:
+                                result = run_report([curl, '-fsSL', '--compressed', '--connect-timeout',
+                                                     '5' if force else '2', '--max-time', str(limit), download_url],
+                                                    timeout=limit + 1, output_limit=20 * 1024 * 1024)
+                                if result.returncode:
+                                    reason = {6: 'DNS lookup failed', 7: 'connection failed',
+                                              22: 'HTTP request rejected', 28: f'download timed out after {limit}s',
+                                              35: 'TLS connection failed', 60: 'TLS certificate validation failed'}.get(
+                                                  result.returncode, f'curl exited with code {result.returncode}')
+                                    raise RuntimeError(reason)
+                                prices = catalog_prices(name, json.loads(result.stdout))
+                                if not prices:
+                                    raise ValueError('Empty catalog')
+                                break
+                            except (OSError, ValueError, TypeError, AttributeError, RuntimeError, subprocess.TimeoutExpired) as error:
+                                last_error = error
+                        else:
+                            raise last_error
+                        entry.update(prices=prices, updated_at=time.time())
+                    except (OSError, ValueError, TypeError, AttributeError, RuntimeError, subprocess.TimeoutExpired) as error:
+                        reason = 'pricing data is invalid' if isinstance(error, (ValueError, TypeError, AttributeError)) else str(error)
+                        fallback = 'keeping cached prices' if entry.get('prices') else 'using other cached / built-in prices'
+                        print(f'Note: {name} pricing refresh failed ({reason}); {fallback}.', file=sys.stderr)
+                if changed:
+                    fd, temporary = tempfile.mkstemp(prefix='.pricing-', dir=str(directory))
+                    try:
+                        with os.fdopen(fd, 'w') as stream:
+                            json.dump(state, stream, allow_nan=False)
+                        os.replace(temporary, state_path)
+                    finally:
+                        if os.path.exists(temporary):
+                            os.unlink(temporary)
+    prices = {}
+    for name in ('models.dev', 'litellm'):
+        for model, item in sources.get(name, {}).get('prices', {}).items():
+            # Revalidate persisted data before handing it to ccusage.
+            if isinstance(item, dict) and all(valid_rate(v) for v in item.values()):
+                prices[model] = item
+    dates = [entry['updated_at'] for entry in sources.values() if entry.get('updated_at')]
+    status = 'cached' if prices else 'built-in'
+    if dates:
+        status += ' · refreshed ' + dt.datetime.fromtimestamp(min(dates)).strftime('%Y-%m-%d')
+    return prices, status
+
+
+@contextmanager
+def pricing_config(prices):
+    """Preserve discovered ccusage settings and explicit user price overrides."""
+    if not prices:
+        yield None
+        return
+    paths = [Path.cwd() / '.ccusage' / 'ccusage.json']
+    configured = os.environ.get('CLAUDE_CONFIG_DIR')
+    folders = [Path(p.strip()) for p in configured.split(',') if p.strip()] if configured is not None else [Path.home() / '.config' / 'claude', Path.home() / '.claude']
+    paths += [folder / 'ccusage.json' for folder in folders]
+    config = {}
+    for path in paths:
+        try:
+            candidate = json.loads(path.read_text())
+            if isinstance(candidate, dict):
+                config = candidate
+                break
+        except (OSError, ValueError):
+            pass
+    defaults = config.setdefault('defaults', {})
+    # Explicit user overrides retain priority over automatically downloaded rates.
+    merged = {name: dict(item) for name, item in prices.items()}
+    for name, item in defaults.get('pricingOverrides', {}).items():
+        merged.setdefault(name, {}).update(item)
+    defaults['pricingOverrides'] = merged
+    with tempfile.TemporaryDirectory(prefix='usage-') as directory:
+        path = Path(directory) / 'ccusage.json'
+        path.write_text(json.dumps(config))
+        yield str(path)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Readable token usage, with complete numbers.',
+        epilog='week = last 7 days; month = last 30 days; both include today. Reasoning is part of output, not added again.')
+    parser.add_argument('period', nargs='?', default='today', choices=['today', 'week', 'month', 'all'])
+    parser.add_argument('--days', '-days', '-d', type=int, help='Custom number of days, including today')
+    parser.add_argument('--since', type=dt.date.fromisoformat, help='Start date: YYYY-MM-DD')
+    parser.add_argument('--until', type=dt.date.fromisoformat, help='End date: YYYY-MM-DD')
+    parser.add_argument('--source', default='codex', choices=['codex', 'claude', 'all'], help='Default: codex')
+    parser.add_argument('--daily', action='store_true', help='Include a compact summary for each day')
+    parser.add_argument('--models', action='store_true', help='Include token totals per model')
+    parser.add_argument('--details', '-v', action='store_true', help='Show daily and model details, including input, output, reasoning and cache')
+    network = parser.add_mutually_exclusive_group()
+    network.add_argument('--online', '--fresh', action='store_true', help='Force a pricing refresh now')
+    network.add_argument('--offline', action='store_true', help='Skip automatic pricing refresh')
+    parser.add_argument('--json', action='store_true', help='Return original ccusage JSON')
+    args = parser.parse_args()
+    if args.days is not None and args.days < 1:
+        parser.error('--days must be at least 1')
+    if args.days is not None and (args.since or args.until):
+        parser.error('--days cannot be combined with --since/--until')
+    today = dt.date.today()
+    end = args.until or today
+    days = args.days if args.days is not None else {'today': 1, 'week': 7, 'month': 30, 'all': None}[args.period]
+    try:
+        start = args.since or (end - dt.timedelta(days=days - 1) if days else None)
+    except OverflowError:
+        parser.error('Date range is too large')
+    if start and start > end:
+        parser.error('--since must not be after --until')
+    exe = shutil.which('ccusage')
+    if not exe:
+        parser.exit(1, 'Error: ccusage was not found on PATH.\n')
+    command = [exe] + ([] if args.source == 'all' else [args.source]) + ['daily', '--json', '--until', end.strftime('%Y%m%d')]
+    if start:
+        command += ['--since', start.strftime('%Y%m%d')]
+    pricing_status = 'built-in'
+    try:
+        prices, pricing_status = cached_pricing(force=args.online, offline=args.offline)
+    except (OSError, ValueError, TypeError, AttributeError) as error:
+        prices = {}
+        print(f'Note: pricing cache unavailable; using built-in prices: {error}', file=sys.stderr)
+    command += ['--offline']
+    config_context = pricing_config(prices)
+    try:
+        # Keep the temporary config alive for both report calls; finally removes it.
+        with config_context as config_path:
+            if config_path:
+                command += ['--config', config_path]
+            result = run_report(command)
+            if result.returncode == 0 and args.source == 'codex' and args.details and not args.json:
+                try:
+                    parsed = json.loads(result.stdout)
+                    if not add_codex_model_costs(parsed, command):
+                        print('Note: some model costs unavailable; rerun to refresh.', file=sys.stderr)
+                    result.stdout = json.dumps(parsed)
+                except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
+                    print(f'Note: model cost lookup failed: {error}', file=sys.stderr)
+    except subprocess.TimeoutExpired:
+        parser.exit(1, 'Error: ccusage timed out after 180 seconds.\n')
+    except (OSError, RuntimeError) as error:
+        parser.exit(1, f'Error: {error}\n')
+    if result.stderr.strip():
+        print(result.stderr.strip(), file=sys.stderr)
+    if result.returncode:
+        parser.exit(result.returncode, result.stdout)
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        parser.exit(1, 'Error: ccusage returned invalid JSON.\n' + result.stdout)
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return
+    totals = data.get('totals', data.get('summary', {}))
+    rows = data.get('daily', data.get('data', []))
+    color = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
+    def heading(text):
+        print(('\033[1;36m' + text + '\033[0m') if color else text)
+    def number(value):
+        return format(value, ',') if isinstance(value, (int, float)) else 'N/A'
+    def metric(label, value):
+        print(f'  {label:<19} {value}')
+    def cost(row):
+        value = row.get('totalCost', row.get('costUSD', row.get('totalCostUSD', row.get('cost'))))
+        return f'${value:,.4f}' if value is not None else 'N/A'
+    token_keys = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheCreationTokens']
+    def model_entries(row):
+        entries = row.get('models', {})
+        if isinstance(entries, dict) and entries:
+            return entries
+        return {item['modelName']: item for item in row.get('modelBreakdowns', [])}
+    def detail(row):
+        for label, key in [('Input', 'inputTokens'), ('Output', 'outputTokens'),
+                           ('  incl. reasoning', 'reasoningOutputTokens'),
+                           ('Cache read', 'cacheReadTokens'), ('Cache create', 'cacheCreationTokens')]:
+            if key in row:
+                print(f'    {label:<19} {number(row[key])}')
+    print()
+    heading('TOKEN USAGE · ' + args.source.upper())
+    print(f'  {start.isoformat() if start else "All history"} → {end.isoformat()}')
+    print('  Pricing: ' + pricing_status)
+    print()
+    if not rows:
+        print('  No usage recorded for this period.\n')
+        return
+    metric('Input', number(totals.get('inputTokens', totals.get('totalInputTokens'))))
+    metric('Output', number(totals.get('outputTokens', totals.get('totalOutputTokens'))))
+    if 'reasoningOutputTokens' in totals:
+        metric('  incl. reasoning', number(totals['reasoningOutputTokens']))
+    metric('Cache read', number(totals.get('cacheReadTokens', totals.get('totalCacheReadTokens'))))
+    metric('Cache create', number(totals.get('cacheCreationTokens', totals.get('totalCacheCreationTokens'))))
+    print()
+    metric('Total tokens', number(totals.get('totalTokens')))
+    metric('Estimated cost', cost(totals))
+    print()
+    if totals.get('unpricedModels'):
+        print('  Unpriced models: ' + ', '.join(totals['unpricedModels']))
+        print('  Estimated cost may be incomplete.\n')
+    if args.daily or args.details:
+        heading('DAILY BREAKDOWN')
+        for row in sorted(rows, key=lambda r: r.get('date', r.get('period', '')), reverse=True):
+            print('  ' + row.get('date', row.get('period', '?')))
+            print(f'    Tokens {number(row.get("totalTokens"))} · Cost {cost(row)}')
+            if args.details:
+                detail(row)
+                names = sorted(model_entries(row))
+                if names:
+                    print('    Models: ' + ', '.join(names))
+                print()
+        print()
+    if args.models or args.details:
+        heading('MODELS')
+        models = defaultdict(lambda: defaultdict(int))
+        for row in rows:
+            for name, item in model_entries(row).items():
+                models[name]['tokens'] += item.get('totalTokens', sum(item.get(k, 0) for k in token_keys))
+                for key in token_keys + ['reasoningOutputTokens']:
+                    if key in item:
+                        models[name][key] += item[key]
+                value = item.get('cost', item.get('costUSD'))
+                if value is not None and not item.get('missingPricing'):
+                    models[name]['cost'] += value
+                else:
+                    models[name]['incompleteCost'] = True
+        for name, item in sorted(models.items(), key=lambda pair: pair[1]['tokens'], reverse=True):
+            print(f'  {name}\n    Tokens {number(item["tokens"])}')
+            if args.details:
+                detail(item)
+                print('    Estimated cost: ' + ('N/A' if item.get('incompleteCost') else cost(item)))
+                print()
+        print()
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, exit_on_signal)
+    signal.signal(signal.SIGHUP, exit_on_signal)
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
